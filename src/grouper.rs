@@ -62,6 +62,7 @@ fn group_by_hash(paths: &[PathBuf]) -> Result<Vec<Vec<PathBuf>>> {
     let mut hash_map: HashMap<u64, Vec<PathBuf>> = HashMap::new();
 
     for path in paths {
+        // TODO - add logging to track which files we can't hash
         // Skip files we can't hash (permission issues, etc.)
         if let Ok(hash) = quick_hash(path) {
             hash_map.entry(hash).or_default().push(path.clone());

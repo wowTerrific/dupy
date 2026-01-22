@@ -22,6 +22,7 @@ fn walk_directory_recursive(path: &Path, files: &mut Vec<FileInfo>) -> Result<()
 
     let metadata = match fs::metadata(path) {
         Ok(m) => m,
+        // TODO- add logging to track which files we can't access
         Err(_) => return Ok(()), // Skip inaccessible files
     };
 
@@ -33,7 +34,10 @@ fn walk_directory_recursive(path: &Path, files: &mut Vec<FileInfo>) -> Result<()
     } else if metadata.is_dir() {
         let entries = match fs::read_dir(path) {
             Ok(e) => e,
-            Err(_) => return Ok(()), // Skip inaccessible directories
+            Err(_) => {
+                // TODO- add logging to track which directories we can't access
+                return Ok(());
+            }
         };
 
         for entry in entries {
