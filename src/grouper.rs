@@ -1,9 +1,36 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
 use crate::error::Result;
 use crate::hasher::{files_identical, quick_hash};
-use crate::scanner::FileInfo;
+use crate::scanner::{walk_directory_names, FileInfo};
+
+macro_rules! progress {
+    ($verbose:expr, $($arg:tt)*) => {
+        if $verbose { eprintln!($($arg)*); }
+    };
+}
+
+pub struct NameDuplicateSet {
+    pub name: OsString,
+    pub files: Vec<PathBuf>,
+}
+
+pub fn find_name_duplicates(directory: &Path) -> Result<Vec<NameDuplicateSet>> {
+    let entries = walk_directory_names(directory)?;
+    let mut map: HashMap<OsString, Vec<PathBuf>> = HashMap::new();
+    for (name, path) in entries {
+        map.entry(name).or_default().push(path);
+    }
+    let mut result: Vec<NameDuplicateSet> = map
+        .into_iter()
+        .filter(|(_, paths)| paths.len() >= 2)
+        .map(|(name, files)| NameDuplicateSet { name, files })
+        .collect();
+    result.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(result)
+}
 
 #[derive(Debug)]
 pub struct DuplicateSet {
@@ -11,37 +38,57 @@ pub struct DuplicateSet {
     pub size: u64,
 }
 
-pub fn find_duplicates(files: Vec<FileInfo>) -> Result<Vec<DuplicateSet>> {
-    // Stage 1: Group by file size
-    let size_groups = group_by_size(files);
+pub fn find_duplicates(
+    files: Vec<FileInfo>,
+    min_size: u64,
+    verbose: bool,
+) -> Result<Vec<DuplicateSet>> {
+    // Filter by min_size
+    let files: Vec<FileInfo> = files.into_iter().filter(|f| f.size >= min_size).collect();
 
-    let mut duplicate_sets = Vec::new();
+    // Stage 1: Group by file size, keep only groups with >= 2 files
+    let size_groups: Vec<(u64, Vec<PathBuf>)> = group_by_size(files)
+        .into_iter()
+        .filter(|(_, paths)| paths.len() >= 2)
+        .collect();
 
-    // Stage 2 & 3: For each size group, use quick hash and verify
+    progress!(
+        verbose,
+        "Checking {} size groups with potential duplicates...",
+        size_groups.len()
+    );
+
+    // Stage 2: Quick hash — collect all hash groups with >= 2 files
+    let mut hash_groups: Vec<(u64, Vec<PathBuf>)> = Vec::new();
     for (size, paths) in size_groups {
-        // Skip groups with only one file
-        if paths.len() < 2 {
-            continue;
-        }
-
-        // Stage 2: Group by quick hash
-        let hash_groups = group_by_hash(&paths)?;
-
-        // Stage 3: Verify each hash group with byte-by-byte comparison
-        for hash_paths in hash_groups {
-            if hash_paths.len() < 2 {
-                continue;
-            }
-
-            let verified_groups = verify_duplicates(hash_paths)?;
-
-            for group in verified_groups {
-                if group.len() >= 2 {
-                    duplicate_sets.push(DuplicateSet { files: group, size });
-                }
+        for group in group_by_hash(&paths)? {
+            if group.len() >= 2 {
+                hash_groups.push((size, group));
             }
         }
     }
+
+    progress!(verbose, "Verifying {} hash groups...", hash_groups.len());
+
+    // Stage 3: Byte-by-byte verification
+    let mut duplicate_sets = Vec::new();
+    for (size, paths) in hash_groups {
+        let verified_groups = verify_duplicates(paths)?;
+        for group in verified_groups {
+            if group.len() >= 2 {
+                duplicate_sets.push(DuplicateSet { files: group, size });
+            }
+        }
+    }
+
+    // Sort descending by wasted space: size * (count - 1)
+    duplicate_sets.sort_by(|a, b| {
+        let wasted_a = a.size * (a.files.len() as u64 - 1);
+        let wasted_b = b.size * (b.files.len() as u64 - 1);
+        wasted_b.cmp(&wasted_a)
+    });
+
+    progress!(verbose, "Done.");
 
     Ok(duplicate_sets)
 }

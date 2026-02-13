@@ -4,7 +4,7 @@ A fast, zero-dependency Rust CLI tool for finding duplicate files in a directory
 
 ## Overview
 
-`dupy` recursively scans a specified directory and identifies duplicate files using an efficient 3-stage algorithm. It outputs results in a human-readable table format to stdout, making it easy to pipe the output for further processing.
+`dupy` recursively scans a specified directory and identifies duplicate files using an efficient 3-stage algorithm. Progress is reported to stderr by default, and results go to stdout — making it easy to redirect output for further processing.
 
 ## Features
 
@@ -13,10 +13,15 @@ A fast, zero-dependency Rust CLI tool for finding duplicate files in a directory
   - Stage 1: Group by file size (cheap operation)
   - Stage 2: Quick hash of first 8KB (fast I/O filter)
   - Stage 3: Byte-by-byte verification (only on likely duplicates)
-- **Memory Efficient**: Uses buffered reading with 8KB chunks - never loads entire files into memory
+- **Name-Only Mode** (`--names`/`-n`): First-pass scan by filename with zero file I/O — fast and memory-efficient for large directories
+- **Sorted Output**: Duplicate groups sorted by wasted space (largest first)
+- **Size Filter** (`--min-size`): Skip files below a size threshold
+- **Progress Reporting**: Scan progress printed to stderr by default; suppress with `--quiet`
+- **CSV Output** (`--format csv`): Machine-readable output for scripting and spreadsheets
+- **Exclude Patterns** (`--exclude`): Glob patterns to skip files by name
+- **Junk File Defaults**: Common junk files (`Thumbs.db`, `.DS_Store`, `desktop.ini`, `~$*`, `*.tmp`, `*.lnk`) excluded by default; override with `--include-junk`
+- **Memory Efficient**: Uses buffered reading with 8KB chunks — never loads entire files into memory
 - **Graceful Error Handling**: Skips inaccessible files and continues scanning
-- **Human-Readable Output**: Shows file sizes in B/KB/MB/GB with summary statistics
-- **Pipeable Output**: Clean stdout format for integration with other tools
 
 ## Building
 
@@ -29,29 +34,88 @@ The compiled binary will be located at `./target/release/dupy`.
 ## Usage
 
 ```bash
-dupy <directory>
+dupy [--names|-n] [--min-size <size>] [--quiet|-q]
+     [--format plain|csv] [--exclude <pattern>]...
+     [--include-junk] <directory>
 ```
+
+| Flag | Description |
+|------|-------------|
+| *(none)* | Full 3-stage content comparison (default) |
+| `--names`, `-n` | Name-only mode: groups files by filename, no hashing or file I/O |
+| `--min-size <size>` | Skip files smaller than `<size>` (e.g. `1MB`, `500KB`, `1048576`) |
+| `--quiet`, `-q` | Suppress progress output on stderr |
+| `--format plain\|csv` | Output format: `plain` (default) or `csv` |
+| `--exclude <pattern>` | Exclude files matching glob pattern (repeatable) |
+| `--include-junk` | Disable built-in junk file exclusions |
+
+### Size suffixes
+
+`--min-size` accepts a number with an optional suffix: `B`, `KB`/`K`, `MB`/`M`, `GB`/`G`.
+Raw byte counts also work: `--min-size 1048576`.
 
 ### Examples
 
-Find duplicates in a directory:
+Find duplicates in a directory (full content check):
 ```bash
 ./target/release/dupy ~/Documents
 ```
 
-Find duplicates and save to a file:
+**First-pass / memory-reduced scan using `--names`:**
 ```bash
-./target/release/dupy ~/Downloads > duplicates.txt
+./target/release/dupy --names ~/Documents
+# or
+./target/release/dupy -n ~/Documents
 ```
 
-Find duplicates and filter by group:
+Name mode scans only filenames — no file reads, no hashing, no byte comparison. It is
+significantly faster and uses far less memory than the default mode, making it a good
+first pass on large or remote directories to spot obvious candidates before running a
+full content scan.
+
+> **Note:** Name matches are not guaranteed to be content duplicates. Use the default
+> mode (or pipe name-mode results) to confirm actual duplicates.
+
+Only scan files 1 MB or larger:
 ```bash
-./target/release/dupy ~/Pictures | grep "Group"
+./target/release/dupy --min-size 1MB ~/Downloads
+```
+
+Export results as CSV:
+```bash
+./target/release/dupy --format csv ~/share > report.csv
+```
+
+Suppress progress output (stdout only):
+```bash
+./target/release/dupy --quiet ~/share
+./target/release/dupy ~/share 2>/dev/null
+```
+
+Exclude backup and log files:
+```bash
+./target/release/dupy --exclude "*.bak" --exclude "*.log" ~/share
+```
+
+Include junk files that are normally skipped:
+```bash
+./target/release/dupy --include-junk ~/share
+```
+
+Combined example for a network share audit:
+```bash
+./target/release/dupy --min-size 1MB --format csv --exclude "*.bak" --quiet ~/share > report.csv
 ```
 
 ## Example Output
 
+### Default mode (content duplicates)
+
 ```
+Scanned 1042 files.
+Checking 18 size groups with potential duplicates...
+Verifying 7 hash groups...
+Done.
 Duplicate Files Report
 ======================
 
@@ -71,6 +135,38 @@ Total duplicate files: 5 (of which 3 are redundant copies)
 Total wasted space: 2.9 MB
 ```
 
+### `--format csv` mode
+
+```
+group_id,size_bytes,size_human,wasted_bytes,wasted_human,file_path
+1,1258291,1.20 MB,2516582,2.40 MB,/home/user/Documents/report.pdf
+1,1258291,1.20 MB,2516582,2.40 MB,/home/user/Downloads/report.pdf
+1,1258291,1.20 MB,2516582,2.40 MB,/home/user/Backup/report.pdf
+2,524288,512.00 KB,524288,512.00 KB,/home/user/Pictures/photo1.jpg
+2,524288,512.00 KB,524288,512.00 KB,/home/user/Pictures/backup/photo1.jpg
+```
+
+### `--names` mode (filename duplicates)
+
+```
+Duplicate Names Report
+======================
+
+Group 1 - "photo1.jpg" (2 files):
+  /home/user/Pictures/photo1.jpg
+  /home/user/Pictures/backup/photo1.jpg
+
+Group 2 - "report.pdf" (3 files):
+  /home/user/Documents/report.pdf
+  /home/user/Downloads/report.pdf
+  /home/user/Backup/report.pdf
+
+Summary:
+--------
+Total groups with shared names: 2
+Total files involved: 5
+```
+
 ## How It Works
 
 ### 3-Stage Duplicate Detection
@@ -81,20 +177,29 @@ Total wasted space: 2.9 MB
 
 3. **Byte-by-Byte Verification**: For remaining candidates, files are compared chunk-by-chunk (8KB chunks) using buffered reading. Only files with identical content are marked as duplicates.
 
-This approach ensures that:
-- Most files are eliminated at the cheap size-check stage
-- The quick hash eliminates most false positives with minimal I/O
-- Full verification is only performed on likely duplicates
+Results are sorted by wasted space (largest first) so the most impactful duplicates appear at the top.
+
+### Glob Pattern Matching
+
+Exclude patterns use a simple built-in glob engine (no external crates):
+- `*` matches any sequence of characters (including empty)
+- `?` matches any single character
+- Patterns match the filename only, not the full path
+- Matching is case-sensitive on all platforms
+
+Built-in junk excludes (active unless `--include-junk` is passed):
+`Thumbs.db`, `.DS_Store`, `desktop.ini`, `~$*`, `*.tmp`, `*.lnk`
 
 ## Project Structure
 
 ```
 src/
 ├── main.rs       # Entry point, CLI parsing, orchestration
-├── scanner.rs    # Directory traversal logic
-├── grouper.rs    # 3-stage duplicate detection algorithm
+├── scanner.rs    # Directory traversal logic with exclusion filtering
+├── grouper.rs    # 3-stage duplicate detection algorithm with progress reporting
 ├── hasher.rs     # Quick hash + byte-by-byte comparison
-├── formatter.rs  # Table output formatting
+├── formatter.rs  # Plain text and CSV output formatting
+├── glob.rs       # Glob pattern matching (*, ?)
 └── error.rs      # Custom error types
 ```
 
@@ -102,7 +207,7 @@ src/
 
 - **Fatal errors**: Invalid directory path, inaccessible target directory
 - **Non-fatal errors**: Permission denied on specific files, symlinks, corrupted files
-  - The tool logs warnings and continues scanning
+  - The tool skips the problematic file and continues scanning
   - Ensures maximum coverage even in directories with problematic files
 
 ## Development
@@ -113,13 +218,21 @@ src/
 # Create test data
 mkdir -p test_data/{unique,duplicates/nested}
 echo "unique content 1" > test_data/unique/file1.txt
-echo "unique content 2" > test_data/unique/file2.txt
 echo "duplicate content" > test_data/duplicates/doc1.txt
 echo "duplicate content" > test_data/duplicates/doc2.txt
 echo "duplicate content" > test_data/duplicates/nested/doc3.txt
 
 # Run dupy
 ./target/release/dupy test_data
+
+# CSV output
+./target/release/dupy --format csv test_data
+
+# Exclude patterns
+./target/release/dupy --exclude "*.txt" test_data
+
+# Min size filter
+./target/release/dupy --min-size 1KB test_data
 ```
 
 ### Code Quality
@@ -137,15 +250,10 @@ cargo fmt --check
 
 ## Future Implementation Ideas
 
-- **Size Filtering**: Add `--min-size` flag to skip files smaller than a threshold
 - **Hidden Files**: Add `--no-hidden` flag to skip hidden files (starting with `.`)
-- **Output Formats**:
-  - `--format csv` for machine-readable output
-  - `--format json` for programmatic processing
-- **Progress Indicators**: Add `--verbose` flag for real-time scanning progress
+- **Output Formats**: `--format json` for programmatic processing
 - **Parallel Processing**: Add parallel file hashing for large directories
 - **Interactive Mode**: Interactive CLI to preview and delete duplicates
-- **Exclude Patterns**: Add `--exclude` flag to skip certain file patterns (e.g., `*.tmp`)
 - **Follow Symlinks**: Add `--follow-symlinks` flag (currently skipped)
 - **Hash Caching**: Cache file hashes to speed up repeated scans
 - **Deduplication Actions**:
